@@ -5,17 +5,24 @@ Pipeline: PDF -> page text -> overlapping chunks -> Gemini embeddings -> FAISS i
 """
 from __future__ import annotations
 
+import os
 import re
+import time
 from dataclasses import dataclass
 
 import numpy as np
 from pypdf import PdfReader
 
 EMBED_MODEL = "gemini-embedding-001"
-CHAT_MODEL = "gemini-2.5-flash"
+# Gemini models get retired (404) or overloaded (503/504), so try these in order
+# and keep using the first one that answers. GEMINI_MODEL in .env overrides the order.
+CHAT_MODELS = [m for m in [os.getenv("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3.5-flash-lite",
+                           "gemini-3.6-flash", "gemini-3.1-flash-lite"] if m]
+RETRYABLE = ("NOT_FOUND", "404", "UNAVAILABLE", "503", "DEADLINE_EXCEEDED", "504", "timed out", "Timeout")
+_working_model: str | None = None
 CHUNK_SIZE = 1200      # characters per chunk
 CHUNK_OVERLAP = 200    # characters shared between neighbouring chunks
-TOP_K = 5
+TOP_K = 8
 EMBED_BATCH = 50
 
 PRESET_QUESTIONS = {
@@ -25,10 +32,20 @@ PRESET_QUESTIONS = {
     "Limitations": "What are the limitations of this work, and what future work do the authors suggest?",
 }
 
+# Extra keywords added to the retrieval query only (not shown to the LLM). Papers rarely use the
+# word "dataset" for benchmarks, so a plain-question search can miss the right chunks.
+SEARCH_HINTS = {
+    "Method": "proposed framework architecture model pipeline algorithm training",
+    "Dataset": "dataset benchmark corpus training data evaluation data samples videos tasks split collected",
+    "Results": "results table accuracy success rate score improvement baseline outperforms",
+    "Limitations": "limitations future work drawbacks challenges fails conclusion",
+}
+
 SYSTEM_PROMPT = """You are a research assistant helping a student write a literature review.
 Answer the question using ONLY the context excerpts from the paper given below.
 Rules:
-1. If the answer is not in the context, reply exactly: "Not found in the paper."
+1. If the context contains nothing relevant to the question, reply exactly: "Not found in the paper."
+   If it contains part of the answer, give that part and say what is missing.
 2. Cite the page number after each fact, like (p. 4).
 3. Use short bullet points. Keep numbers, dataset names and metric names exactly as written.
 4. Do not use outside knowledge and do not guess."""
@@ -87,11 +104,19 @@ def embed_texts(client, texts: list[str], task_type: str) -> np.ndarray:
     vectors = []
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i:i + EMBED_BATCH]
-        result = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=batch,
-            config=types.EmbedContentConfig(task_type=task_type),
-        )
+        for attempt in range(4):
+            try:
+                result = client.models.embed_content(
+                    model=EMBED_MODEL,
+                    contents=batch,
+                    config=types.EmbedContentConfig(task_type=task_type),
+                )
+                break
+            except Exception as e:  # free tier: ~100 embeddings/minute -> wait and retry on 429
+                if ("429" not in str(e) and "RESOURCE_EXHAUSTED" not in str(e)) or attempt == 3:
+                    raise
+                print(f"[rag] embedding rate limit hit, waiting 30 s (attempt {attempt + 1})", flush=True)
+                time.sleep(30)
         vectors.extend(e.values for e in result.embeddings)
     return _normalize(np.array(vectors, dtype="float32"))
 
@@ -119,7 +144,25 @@ def build_prompt(question: str, hits: list[tuple[Chunk, float]]) -> str:
     return f"{SYSTEM_PROMPT}\n\nCONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"
 
 
-def answer(client, index: PaperIndex, question: str) -> tuple[str, list[tuple[Chunk, float]]]:
-    hits = index.search(question)
-    response = client.models.generate_content(model=CHAT_MODEL, contents=build_prompt(question, hits))
-    return (response.text or "No answer returned.").strip(), hits
+def answer(client, index: PaperIndex, question: str, search_hint: str = "") -> tuple[str, list[tuple[Chunk, float]]]:
+    global _working_model
+    hits = index.search(f"{question} {search_hint}".strip())
+    prompt = build_prompt(question, hits)
+    candidates = list(dict.fromkeys(([_working_model] if _working_model else []) + CHAT_MODELS))
+    last_error = None
+    for model in candidates:
+        try:
+            print(f"[rag] trying {model}", flush=True)
+            response = client.models.generate_content(model=model, contents=prompt)
+            _working_model = model
+            return (response.text or "No answer returned.").strip(), hits
+        except Exception as e:  # retired or overloaded model: fall through to the next one
+            if not any(code in str(e) for code in RETRYABLE):
+                raise
+            print(f"[rag] {model} failed: {str(e)[:120]}", flush=True)
+            last_error = e
+    raise RuntimeError(f"All Gemini models are unavailable right now. Last error: {last_error}")
+
+
+def current_model() -> str:
+    return _working_model or CHAT_MODELS[0]

@@ -2,5 +2,9 @@
 venv/
 __pycache__/
 *.pyc
+shots_log.txt
+push_to_github.bat
+screenshots/results.json
+samples/*.pdf
 push_log.txt
 run_log.txt

@@ -4,3 +4,4 @@ pypdf>=4.0
 faiss-cpu>=1.8
 numpy>=1.26
 python-dotenv>=1.0
+playwright>=1.40  # only needed for make_screenshots.py

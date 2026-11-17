@@ -10,5 +10,5 @@ echo Installing packages...
 pip install -q -r requirements.txt
 if not exist .env copy .env.example .env >nul
 echo Starting the app at http://localhost:8501 ...
-streamlit run app.py
+streamlit run app.py --server.headless true
 pause
